@@ -1,7 +1,11 @@
 from functools import lru_cache
+from typing import Literal
 
 from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+from app.schemas.chat import DEFAULT_MODEL
 
 
 class Settings(BaseSettings):
@@ -26,8 +30,11 @@ class Settings(BaseSettings):
 
     JEV_API_KEY: SecretStr = SecretStr("")
     JEV_MODEL: str = "jev-latest"
-    JEV_TIMEOUT_SECONDS: float = Field(default=10, gt=0, le=30)
-    JEV_POINTS_COST: int = Field(default=100, gt=0)
+    SEMANTIC_CHOICE_ENABLED: bool = False
+    SEMANTIC_CHOICE_PROVIDER: Literal["openai_compatible", "jev"] = "openai_compatible"
+    SEMANTIC_CHOICE_MODEL: str = DEFAULT_MODEL
+    SEMANTIC_CHOICE_TIMEOUT_SECONDS: float = Field(default=10, gt=0, le=30)
+    SEMANTIC_CHOICE_POINTS_COST: int = Field(default=100, gt=0)
 
     CUA_BASE_URL: str
     CUA_API_KEY: str

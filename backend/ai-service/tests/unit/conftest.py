@@ -19,10 +19,13 @@ def isolated_settings(monkeypatch, tmp_path):
         "XFYUN_API_KEY": "unit",
         "JFBYM_API_TOKEN": "unit",
         "LOG_DIR": str(tmp_path),
+        "SEMANTIC_CHOICE_ENABLED": "false",
+        "SEMANTIC_CHOICE_PROVIDER": "openai_compatible",
+        "SEMANTIC_CHOICE_MODEL": "maas/deepseek-v3.2",
         "JEV_API_KEY": "",
         "JEV_MODEL": "jev-latest",
-        "JEV_TIMEOUT_SECONDS": "10",
-        "JEV_POINTS_COST": "100",
+        "SEMANTIC_CHOICE_TIMEOUT_SECONDS": "10",
+        "SEMANTIC_CHOICE_POINTS_COST": "100",
     }
     for name, value in values.items():
         monkeypatch.setenv(name, value)

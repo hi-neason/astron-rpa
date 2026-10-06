@@ -49,4 +49,9 @@ class ChoiceRequest(BaseModel):
 class ChoiceResponse(BaseModel):
     status: Literal["matched", "abstain"]
     selected_id: str | None
-    confidence: float = Field(strict=True, ge=0, le=1, allow_inf_nan=False)
+    confidence: float | None = Field(strict=True, ge=0, le=1, allow_inf_nan=False)
+
+
+class ChoiceCapabilities(BaseModel):
+    enabled: bool
+    reason: str | None

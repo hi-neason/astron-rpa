@@ -171,3 +171,20 @@ def test_initialization_and_upgrade_publish_the_same_node():
     sql_json = migration.split("SELECT 'SemanticAI.choose', '", 1)[1].split("'\nWHERE NOT EXISTS", 1)[0]
     published = json.loads(sql_json.replace("''", "'").replace("\\\\", "\\"))
     assert published == json.loads((COMPONENT / "meta.json").read_text())["SemanticAI.choose"]
+
+
+def test_accepts_provider_without_native_confidence(semantic, monkeypatch):
+    response = Mock()
+    response.json.return_value = {"status": "matched", "selected_id": "refund", "confidence": None}
+    monkeypatch.setattr(semantic.requests, "post", Mock(return_value=response))
+    assert semantic.SemanticAI.choose("分类", "退款", OPTIONS)["confidence"] is None
+
+
+def test_disabled_node_reports_configuration_variable(semantic, monkeypatch):
+    response = Mock(status_code=503)
+    response.json.return_value = {"detail": "Set SEMANTIC_CHOICE_ENABLED=true to enable semantic choice"}
+    response.raise_for_status.side_effect = semantic.requests.HTTPError("503 Service Unavailable")
+    monkeypatch.setattr(semantic.requests, "post", Mock(return_value=response))
+    with pytest.raises(semantic.requests.HTTPError, match="SEMANTIC_CHOICE_ENABLED"):
+        semantic.SemanticAI.choose("分类", "退款", OPTIONS)
+    response.close.assert_called_once()

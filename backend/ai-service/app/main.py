@@ -26,7 +26,7 @@ async def lifespan(app: FastAPI):
 
     try:
         async with httpx.AsyncClient() as client:
-            app.state.jev_http_client = client
+            app.state.decision_http_client = client
             yield
     finally:
         await close_redis_pool()

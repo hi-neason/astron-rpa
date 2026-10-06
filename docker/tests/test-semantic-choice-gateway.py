@@ -6,6 +6,7 @@ OPENRESTY_IMAGE (default: openresty/openresty:1.27.1.1-alpine). No paid API call
 """
 
 import os
+import json
 from pathlib import Path
 import signal
 import socket
@@ -56,17 +57,20 @@ def build_app(log_dir):
         XFYUN_API_SECRET="smoke",
         XFYUN_API_KEY="smoke",
         JFBYM_API_TOKEN="smoke",
-        JEV_API_KEY="smoke-never-sent-to-network",
-        JEV_MODEL="jev-latest",
-        JEV_TIMEOUT_SECONDS="10",
-        JEV_POINTS_COST="100",
+        SEMANTIC_CHOICE_ENABLED="true",
+        SEMANTIC_CHOICE_PROVIDER="openai_compatible",
+        SEMANTIC_CHOICE_MODEL="smoke-model",
+        SEMANTIC_CHOICE_TIMEOUT_SECONDS="10",
+        SEMANTIC_CHOICE_POINTS_COST="100",
         LOG_DIR=str(log_dir),
     )
     sys.path.insert(0, str(ROOT / "backend/ai-service"))
+    from app.config import get_settings
     from app.dependencies import get_user_point_service
     from app.routers.v1.decision import router
 
     state = SimpleNamespace(
+        settings=get_settings(),
         choice="candidate_0",
         provider_status=200,
         provider_calls=[],
@@ -83,20 +87,19 @@ def build_app(log_dir):
         return httpx.Response(
             state.provider_status,
             json={
-                "answers": {
-                    "selection": {
-                        "type": "choice",
-                        "choice": state.choice,
-                        "confidence": 0.9,
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": json.dumps({"choice": state.choice})},
                     }
-                }
+                ]
             },
         )
 
     @asynccontextmanager
     async def lifespan(app):
         async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
-            app.state.jev_http_client = client
+            app.state.decision_http_client = client
             yield
 
     app = FastAPI(lifespan=lifespan)
@@ -190,7 +193,7 @@ def check_requests(base_url, state):
             assert response.json() == {
                 "status": "matched",
                 "selected_id": "refund",
-                "confidence": 0.9,
+                "confidence": None,
             }
             assert state.points.deduct_points.await_count == before + 1
             assert (
@@ -241,7 +244,7 @@ def check_requests(base_url, state):
         assert response.json() == {
             "status": "abstain",
             "selected_id": None,
-            "confidence": 0.9,
+            "confidence": None,
         }
         assert state.points.deduct_points.await_count == before + 1
         print("PASS abstention: valid result charged once")
@@ -255,6 +258,30 @@ def check_requests(base_url, state):
         assert len(state.provider_calls) == calls + 1
         assert state.points.deduct_points.await_count == before
         print("PASS provider failure: one attempt, sanitized error, no deduction")
+
+        before = (len(state.provider_calls), state.points.deduct_points.await_count)
+        ready = client.get(
+            "/api/rpa-ai-service/v1/decision/capabilities",
+            headers={"Token": "valid-token"},
+        )
+        assert ready.json() == {"enabled": True, "reason": None}
+        state.settings.SEMANTIC_CHOICE_ENABLED = False
+        unavailable = client.get(
+            "/api/rpa-ai-service/v1/decision/capabilities",
+            headers={"Token": "valid-token"},
+        )
+        assert unavailable.json()["enabled"] is False
+        assert "SEMANTIC_CHOICE_ENABLED" in unavailable.json()["reason"]
+        response = choice({"Token": "valid-token"})
+        assert response.status_code == 503
+        assert "SEMANTIC_CHOICE_ENABLED" in response.json()["detail"]
+        assert before == (
+            len(state.provider_calls),
+            state.points.deduct_points.await_count,
+        )
+        print(
+            "PASS capabilities and disabled execution: actionable config, no paid calls"
+        )
 
         # The existing sibling route accepts Bearer; only the longer decision
         # location should reject it. This detects accidental broad route changes.
@@ -347,7 +374,7 @@ def main():
                 raise RuntimeError("Fixture gateway failed to start")
             check_requests(base, state)
             print(
-                "PASS 12 production-route smoke cases (mock auth, provider and points store)"
+                "PASS 15 production-route smoke cases (mock auth, provider and points store)"
             )
         except BaseException:
             for container in (gateway, auth):

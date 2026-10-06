@@ -37,7 +37,11 @@ async def api():
         delay=0,
         requests=[],
         settings=get_settings().model_copy(
-            update={"JEV_API_KEY": SecretStr("test-jev-secret")}
+            update={
+                "JEV_API_KEY": SecretStr("test-jev-secret"),
+                "SEMANTIC_CHOICE_ENABLED": True,
+                "SEMANTIC_CHOICE_PROVIDER": "jev",
+            }
         ),
         points=SimpleNamespace(
             grant_monthly_points=AsyncMock(),
@@ -57,7 +61,7 @@ async def api():
     app.dependency_overrides[get_settings] = lambda: state.settings
     app.dependency_overrides[get_user_point_service] = lambda: state.points
     async with httpx.AsyncClient(transport=httpx.MockTransport(upstream)) as provider:
-        app.state.jev_http_client = provider
+        app.state.decision_http_client = provider
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app),
             base_url="http://test",
@@ -65,7 +69,7 @@ async def api():
         ) as client:
             state.client = client
             yield state
-    del app.state.jev_http_client
+    del app.state.decision_http_client
     app.dependency_overrides.clear()
 
 
@@ -105,7 +109,7 @@ async def test_choice_maps_provider_key_to_business_id_and_charges_once(api, cap
     api.points.deduct_points.assert_awaited_once_with(
         user_id="unit-user",
         amount=100,
-        transaction_type=PointTransactionType.AICHAT_COST,
+        transaction_type=PointTransactionType.SEMANTIC_CHOICE_COST,
     )
     assert "test-jev-secret" not in caplog.text
     assert PAYLOAD["text"] not in caplog.text
@@ -222,8 +226,10 @@ async def test_malformed_provider_answer_is_error_not_abstention(api, body):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["jev", "openai_compatible"])
 @pytest.mark.parametrize("status", [401, 422, 429, 500, 529])
-async def test_provider_errors_do_not_leak_details_or_charge(api, status):
+async def test_provider_errors_do_not_leak_details_or_charge(api, status, provider):
+    api.settings.SEMANTIC_CHOICE_PROVIDER = provider
     api.status = status
     api.body = {"error": "test-jev-secret confidential upstream message"}
     response = await api.client.post("/v1/decision/choice", json=PAYLOAD)
@@ -250,7 +256,7 @@ async def test_transport_failure_never_becomes_abstention(api, error, status):
 @pytest.mark.asyncio
 async def test_total_inference_deadline(api):
     api.delay = 1
-    api.settings.JEV_TIMEOUT_SECONDS = 0.01
+    api.settings.SEMANTIC_CHOICE_TIMEOUT_SECONDS = 0.01
     response = await api.client.post("/v1/decision/choice", json=PAYLOAD)
     assert response.status_code == 504
     api.points.deduct_points.assert_not_awaited()
@@ -265,9 +271,9 @@ async def test_lifespan_reuses_and_closes_provider_client(monkeypatch):
     close_redis = AsyncMock()
     monkeypatch.setattr(main, "close_redis_pool", close_redis)
     async with main.lifespan(main.app):
-        client = main.app.state.jev_http_client
+        client = main.app.state.decision_http_client
         assert not client.is_closed
-        assert main.app.state.jev_http_client is client
+        assert main.app.state.decision_http_client is client
     assert client.is_closed
     close_redis.assert_awaited_once()
 
@@ -316,3 +322,135 @@ async def test_engine_component_through_real_decision_route(
     result = await asyncio.to_thread(component.SemanticAI.choose, **PAYLOAD)
     assert result == {"status": status, "selected_id": selected, "confidence": 0.9}
     api.points.deduct_points.assert_awaited_once()
+
+
+def test_generic_configuration_defaults():
+    from app.config import get_settings
+    from app.schemas.chat import DEFAULT_MODEL
+
+    settings = get_settings()
+    assert settings.SEMANTIC_CHOICE_ENABLED is False
+    assert settings.SEMANTIC_CHOICE_PROVIDER == "openai_compatible"
+    assert settings.SEMANTIC_CHOICE_MODEL == DEFAULT_MODEL
+
+
+@pytest.mark.asyncio
+async def test_capabilities_explain_disabled_configuration_without_billing(api):
+    api.settings = api.settings.model_copy(update={"SEMANTIC_CHOICE_ENABLED": False})
+    response = await api.client.get("/v1/decision/capabilities")
+    assert response.status_code == 200
+    assert response.json() == {
+        "enabled": False,
+        "reason": "Set SEMANTIC_CHOICE_ENABLED=true to enable semantic choice",
+    }
+    api.points.get_cached_points.assert_not_awaited()
+    assert not api.requests
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "choice,selected", [("candidate_1", "shipping"), ("__abstain__", None)]
+)
+async def test_openai_structured_choice_uses_existing_credentials(
+    api, choice, selected
+):
+    import json
+
+    api.settings.SEMANTIC_CHOICE_PROVIDER = "openai_compatible"
+    api.body = {
+        "choices": [
+            {
+                "finish_reason": "stop",
+                "message": {"content": json.dumps({"choice": choice})},
+            }
+        ]
+    }
+    response = await api.client.post("/v1/decision/choice", json=PAYLOAD)
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "matched" if selected else "abstain",
+        "selected_id": selected,
+        "confidence": None,
+    }
+    request = api.requests[0]
+    assert str(request.url) == "https://chat.invalid/v1/chat/completions"
+    assert request.headers["Authorization"] == "Bearer unit"
+    wire = json.loads(request.content)
+    assert wire["model"] == api.settings.SEMANTIC_CHOICE_MODEL
+    schema = wire["response_format"]["json_schema"]
+    assert schema["strict"] is True
+    assert schema["schema"]["properties"]["choice"]["enum"] == [
+        "candidate_0",
+        "candidate_1",
+        "__abstain__",
+    ]
+    assert json.loads(wire["messages"][1]["content"])["text"] == PAYLOAD["text"]
+    api.points.deduct_points.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "message,finish",
+    [
+        ({"content": '{"choice":"unknown"}'}, "stop"),
+        ({"content": '```json\n{"choice":"candidate_0"}\n```'}, "stop"),
+        ({"content": '{"choice":"candidate_0", "confidence":0.9}'}, "stop"),
+        ({"content": '{"choice":"candidate_0"}'}, "length"),
+        ({"content": '{"choice":"candidate_0"}', "refusal": "Cannot answer"}, "stop"),
+        ({"content": None}, "stop"),
+        (None, "stop"),
+        ([], "stop"),
+        ("invalid", "stop"),
+    ],
+)
+async def test_invalid_openai_output_is_not_billed_or_retried(api, message, finish):
+    api.settings.SEMANTIC_CHOICE_PROVIDER = "openai_compatible"
+    api.body = {"choices": [{"finish_reason": finish, "message": message}]}
+    response = await api.client.post("/v1/decision/choice", json=PAYLOAD)
+    assert response.status_code == 502
+    assert len(api.requests) == 1
+    api.points.deduct_points.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "provider,variable",
+    [
+        ("jev", "JEV_API_KEY"),
+        ("jev", "JEV_MODEL"),
+        ("openai_compatible", "AICHAT_API_KEY"),
+        ("openai_compatible", "AICHAT_BASE_URL"),
+        ("openai_compatible", "SEMANTIC_CHOICE_MODEL"),
+    ],
+)
+async def test_capability_and_execution_report_missing_variable(
+    api, provider, variable
+):
+    api.settings.SEMANTIC_CHOICE_PROVIDER = provider
+    setattr(
+        api.settings, variable, SecretStr(" ") if variable == "JEV_API_KEY" else " "
+    )
+    readiness = await api.client.get("/v1/decision/capabilities")
+    assert readiness.status_code == 200
+    assert readiness.json()["enabled"] is False
+    assert variable in readiness.json()["reason"]
+    response = await api.client.post("/v1/decision/choice", json=PAYLOAD)
+    assert response.status_code == 503
+    assert response.json()["detail"] == readiness.json()["reason"]
+    assert not api.requests
+    api.points.get_cached_points.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider", ["jev", "openai_compatible"])
+async def test_enabled_capability_does_not_probe_or_bill(api, provider):
+    api.settings.SEMANTIC_CHOICE_PROVIDER = provider
+    response = await api.client.get("/v1/decision/capabilities")
+    assert response.json() == {"enabled": True, "reason": None}
+    assert not api.requests
+    api.points.get_cached_points.assert_not_awaited()
+    api.client.headers.pop("X-User-Id")
+    assert (await api.client.get("/v1/decision/capabilities")).json() == {
+        "enabled": True,
+        "reason": None,
+    }

@@ -46,6 +46,15 @@ class SemanticAI:
             timeout=(5, 35),
         )
         try:
+            if response.status_code == 503:
+                # Only expose our configuration error, not arbitrary upstream bodies.
+                try:
+                    body = response.json()
+                    detail = body.get("detail") if isinstance(body, dict) else None
+                except ValueError:
+                    detail = None
+                if isinstance(detail, str) and detail:
+                    raise requests.HTTPError(detail, response=response)
             response.raise_for_status()
             result = response.json()
         finally:
@@ -55,13 +64,11 @@ class SemanticAI:
         confidence = result["confidence"]
         selected_id = result["selected_id"]
         if (
-            type(confidence) not in (int, float)
-            or not math.isfinite(confidence)
-            or not 0 <= confidence <= 1
-            or not (
-                (result["status"] == "matched" and isinstance(selected_id, str) and selected_id in option_ids)
-                or (result["status"] == "abstain" and selected_id is None)
-            )
+            confidence is not None
+            and (type(confidence) not in (int, float) or not math.isfinite(confidence) or not 0 <= confidence <= 1)
+        ) or not (
+            (result["status"] == "matched" and isinstance(selected_id, str) and selected_id in option_ids)
+            or (result["status"] == "abstain" and selected_id is None)
         ):
             raise ValueError("Invalid semantic choice response")
         return result
